@@ -6,6 +6,7 @@ from torch.nn import functional as F
 n_head = 4
 batch_size = 32
 block_size = 8
+dropout = 0.2
 max_iters = 5000
 eval_interval = 500
 learning_rate = 1e-3
@@ -19,7 +20,7 @@ n_embd = 32
 torch.manual_seed(2023)
 
 # Load the Victor Hugo dataset
-with open('data/hugo_contemplations.txt', 'r', encoding='utf-8') as f:
+with open('hugo_contemplations.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 
 # here are all the unique characters that occur in this text
@@ -64,15 +65,16 @@ def estimate_loss():
 class Head(nn.Module):
     """ one head of self-attention """
 
-    def __init__(self, head_size, C, block_size):
+    def __init__(self, head_size):
         super().__init__()
-        # YOUR CODE
+
         # add you key, query and value definitions
-        self.key = nn.Linear(C, head_size)
+        self.key = nn.Linear(n_embd, head_size)
         # define the Query layer
-        self.query = nn.Linear(C, head_size)
+        self.query = nn.Linear(n_embd, head_size)
         # define the Value layer
-        self.value = nn.Linear(C, head_size)
+        self.value = nn.Linear(n_embd, head_size)
+        self.attn_dropout = nn.Dropout(dropout)
         
         ###
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
@@ -87,16 +89,17 @@ class Head(nn.Module):
         v = self.value(x) # (B, T, head_size)
         
         # compute the normalize product between Q and K 
-        weights = q @ k.transpose(-2, -1) # (B, T, head_size) @ (B, 16, head_size) -> (B, T, T)
+        weights = q @ k.transpose(-2, -1) / (self.key.weight.size(0) ** 0.5)  
+
+        # Si T=1, on ne masque pas
+        if T > 1:
+            weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         
-        # apply the normalization factor
-        weights = weights / (self.key.weight.size(0) ** 0.5) 
-        
-        # apply the mask (lower triangular matrix)
-        weights = weights.masked_fill(self.tril== 0, float('-inf'))
-        
+        # weights = weights.masked_fill(self.tril == 0, float('-inf'))
+
         # apply the softmax
         weights = F.softmax(weights, dim=-1) 
+        weights = self.attn_dropout(weights)
         
         ###      
     
@@ -110,41 +113,44 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         ## list of num_heads modules of type Head
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
         ###
         
     def forward(self, x):
-        ## apply each head in self.heads to x and concat the results
-        heads = [h(x) for h in self.heads]
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-
+        out = self.proj(out)
+        out = self.dropout(out)
         return out
 
-# class FeedForward(nn.Module):
-#     """ a simple MLP with RELU """
+class FeedForward(nn.Module):
+    """ a simple MLP with RELU """
 
-#     def __init__(self, n_embd):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(n_embd, n_embd),
-#             nn.ReLU(),
-#         )
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
 
-#     def forward(self, x):
-#         return self.net(x)
+    def forward(self, x):
+        return self.net(x)
 
-# class Block(nn.Module):
-#     """ A single bloc of multi-head attention """
-
-#     def __init__(self, n_embd, n_head):
-#         super().__init__()
-#         head_size = n_embd // n_head
-#         self.sa = MultiHeadAttention(n_head, head_size)
-#         self.ffwd = FeedForward(n_embd)
-
-#     def forward(self, x):
-#         x = self.sa(x)
-#         x = self.ffwd(x)
-#         return x
+class Block(nn.Module):
+  
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.ln1 = nn.LayerNorm(n_embd)  # LayerNorm avant MultiHeadAttention
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ln2 = nn.LayerNorm(n_embd)  # LayerNorm avant FeedForward
+        self.ff = FeedForward(n_embd)
+      
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
+        return x
 
 class BigramLanguageModel(nn.Module):
 
@@ -152,8 +158,13 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.sa_head = MultiHeadAttention(num_heads = n_head, head_size = n_embd // n_head)
-        # self.ff = FeedForward(n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            nn.LayerNorm(n_embd)  # LayerNorm après la série de blocs
+        )
+        
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -163,8 +174,9 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        x = self.sa_head(x) # (B,T,C)
-        #x = self.ff(x)
+        # x = self.sa_head(x) # (B,T,C)
+        # x = self.ff(x)
+        x = self.blocks(x)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
@@ -220,6 +232,7 @@ for iter in range(max_iters):
 
 
 # generate from the model
-prompt = torch.tensor(encode(['\n']))
-context = torch.ones((1,1), dtype=torch.long, device=device)*prompt
+prompt = torch.tensor(encode(['\n']), device=device)  # Déplace prompt sur le bon device
+context = torch.ones((1,1), dtype=torch.long, device=device) * prompt
+
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))

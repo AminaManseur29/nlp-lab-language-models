@@ -90,7 +90,7 @@ class Head(nn.Module):
 
         # Si T=1, on ne masque pas
         if T > 1:
-            weights = weights.masked_fill(self.tril == 0, float('-inf'))
+            weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
             
         weights = F.softmax(weights, dim=-1)
         
@@ -171,6 +171,7 @@ for iter in range(max_iters):
     optimizer.step()
 
 # generate from the model
-prompt = torch.tensor(encode(['\n']))
-context = torch.ones((1,1), dtype=torch.long, device=device)*prompt
+prompt = torch.tensor(encode(['\n']), device=device)  # Déplace prompt sur le bon device
+context = torch.ones((1,1), dtype=torch.long, device=device) * prompt
+
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
