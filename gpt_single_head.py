@@ -86,16 +86,13 @@ class Head(nn.Module):
         v = self.value(x) # (B, T, head_size)
         
         # compute the normalize product between Q and K 
-        weights = q @ k.transpose(-2, -1) # (B, T, head_size) @ (B, 16, head_size) -> (B, T, T)
-        
-        # apply the normalization factor
-        weights = weights / (self.key.weight.size(0) ** 0.5) 
-        
-        # apply the mask (lower triangular matrix)
-        weights = weights.masked_fill(self.tril== 0, float('-inf'))
-        
-        # apply the softmax
-        weights = F.softmax(weights, dim=-1) 
+        weights = q @ k.transpose(-2, -1) / (self.key.weight.size(0) ** 0.5)  
+
+        # Si T=1, on ne masque pas
+        if T > 1:
+            weights = weights.masked_fill(self.tril == 0, float('-inf'))
+            
+        weights = F.softmax(weights, dim=-1)
         
         ###      
     
@@ -172,7 +169,6 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-
 
 # generate from the model
 prompt = torch.tensor(encode(['\n']))
